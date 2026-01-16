@@ -6,16 +6,38 @@
 # Or: . local_env_curls.sh
 
 # Get the directory where this script is located
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# This works whether the script is sourced or executed directly, and handles both relative and absolute paths
+# ${BASH_SOURCE[0]} gives us the path to the script file, even when sourced
+# We resolve it to an absolute path to ensure it works from any directory
+if [ -n "${BASH_SOURCE[0]}" ]; then
+    # Resolve the script path to an absolute path
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+else
+    # Fallback if BASH_SOURCE is not available (shouldn't happen in bash/zsh)
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+fi
+
+# Verify SCRIPT_DIR was resolved correctly
+if [ ! -d "$SCRIPT_DIR" ]; then
+    echo "Error: Could not determine script directory" >&2
+    return 1 2>/dev/null || exit 1
+fi
 
 # Source utility functions first (they're needed by all other modules)
+if [ ! -f "$SCRIPT_DIR/utils.sh" ]; then
+    echo "Error: Could not find utils.sh in $SCRIPT_DIR" >&2
+    return 1 2>/dev/null || exit 1
+fi
 source "$SCRIPT_DIR/utils.sh"
 
 # Source service-specific modules
-source "$SCRIPT_DIR/organization.sh"
-source "$SCRIPT_DIR/auth.sh"
-source "$SCRIPT_DIR/tasklist.sh"
-source "$SCRIPT_DIR/workflows.sh"
+for module in organization.sh auth.sh tasklist.sh workflows.sh; do
+    if [ ! -f "$SCRIPT_DIR/$module" ]; then
+        echo "Error: Could not find $module in $SCRIPT_DIR" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    source "$SCRIPT_DIR/$module"
+done
 
 # Main menu (only shown when script is executed directly)
 show_menu() {

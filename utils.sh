@@ -78,6 +78,78 @@ show_error_details() {
     fi
 }
 
+# Helper function to query organization ID from database
+get_learntowin_org_id() {
+    local org_id=""
+    local db_host="${L2W_POSTGRES_HOST:-localhost}"
+    local db_port="${L2W_POSTGRES_PORT:-5432}"
+    local db_user="postgres"
+    local db_password="password"
+    local db_name="organization"
+    
+    # Try to query via psql (local or docker)
+    if command -v psql &> /dev/null; then
+        # Try local psql connection
+        org_id=$(PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" -t -c "SELECT id FROM organizations WHERE slug = 'learntowin' LIMIT 1;" 2>/dev/null | xargs 2>/dev/null)
+    elif command -v docker &> /dev/null && docker ps | grep -q postgres; then
+        # Try via docker exec
+        local container_name=$(docker ps --format '{{.Names}}' | grep -i postgres | head -1)
+        if [ -n "$container_name" ]; then
+            org_id=$(docker exec "$container_name" psql -U "$db_user" -d "$db_name" -t -c "SELECT id FROM organizations WHERE slug = 'learntowin' LIMIT 1;" 2>/dev/null | xargs 2>/dev/null)
+        fi
+    fi
+    
+    # Clean up the org_id (remove whitespace)
+    org_id=$(echo "$org_id" | tr -d '[:space:]')
+    
+    # Return empty if not found or invalid UUID format
+    if [ -z "$org_id" ] || [ "$org_id" = "null" ] || ! echo "$org_id" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+        echo ""
+    else
+        echo "$org_id"
+    fi
+}
+
+# Helper function to prompt for organization ID with database lookup
+prompt_organization_id() {
+    local var_value
+    
+    # Get the value of the variable using eval (works in both bash and zsh)
+    eval "var_value=\${ORGANIZATION_ID:-}"
+    
+    if [ -z "$var_value" ]; then
+        # Try to get from database
+        local db_org_id=$(get_learntowin_org_id)
+        
+        if [ -n "$db_org_id" ]; then
+            # Found in database, prompt user
+            print_info "Found Learn To Win Organization in database: $db_org_id"
+            local use_db_org=""
+            if [ -n "${ZSH_VERSION:-}" ]; then
+                read "use_db_org?Do you want to use the Learn To Win Organization? (y/n): "
+            else
+                read -p "Do you want to use the Learn To Win Organization? (y/n): " use_db_org
+            fi
+            
+            if [ "$use_db_org" = "y" ] || [ "$use_db_org" = "Y" ] || [ "$use_db_org" = "yes" ] || [ "$use_db_org" = "Yes" ]; then
+                export ORGANIZATION_ID="$db_org_id"
+                print_success "Using organization ID: $ORGANIZATION_ID"
+                return 0
+            fi
+        else
+            print_warning "Unable to query Learn To Win Organization from DB"
+        fi
+        
+        # Prompt normally if not using DB org or DB query failed
+        if [ -n "${ZSH_VERSION:-}" ]; then
+            read "var_value?Enter Organization ID: "
+        else
+            read -p "Enter Organization ID: " var_value
+        fi
+        export ORGANIZATION_ID="$var_value"
+    fi
+}
+
 # Helper function to prompt for input if variable is not set
 prompt_if_missing() {
     local var_name=$1

@@ -8,7 +8,7 @@
 create_user() {
     print_info "Creating user..."
     
-    prompt_if_missing ORGANIZATION_ID "Enter Organization ID"
+    prompt_organization_id
     prompt_if_missing EMAIL "Enter user email"
     prompt_if_missing ROLE "Enter role (e.g., ROLE_ADMIN, ROLE_SUPER_ADMIN)"
     
@@ -94,7 +94,7 @@ verify_token_access() {
     
     prompt_if_missing CONTEXT_TOKEN "Enter context token"
     prompt_if_missing IDP_TOKEN "Enter IDP token"
-    prompt_if_missing ORGANIZATION_ID "Enter Organization ID"
+    prompt_organization_id
     
     print_info "Verifying access for org: $ORGANIZATION_ID"
     

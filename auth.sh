@@ -43,7 +43,7 @@ create_context_token() {
     print_info "Creating context token..."
     
     prompt_if_missing IDP_TOKEN "Enter IDP token"
-    prompt_if_missing ORGANIZATION_ID "Enter Organization ID"
+    prompt_organization_id
     
     print_info "Creating context token for org: $ORGANIZATION_ID"
     
