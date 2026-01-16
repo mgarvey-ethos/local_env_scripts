@@ -22,20 +22,37 @@ GATEWAY_URL="${GATEWAY_URL:-http://localhost:8050}"
 ORGANIZATION_SERVICE_URL="${ORGANIZATION_SERVICE_URL:-http://localhost:8002/organization/api}"
 
 # Helper function to print colored output
+# If NO_COLOR is set to "1", outputs without colors
 print_info() {
-    echo -e "${BLUE}ℹ${NC} $1"
+    if [ "${NO_COLOR:-}" = "1" ]; then
+        echo "ℹ $1"
+    else
+        echo -e "${BLUE}ℹ${NC} $1"
+    fi
 }
 
 print_success() {
-    echo -e "${GREEN}✓${NC} $1"
+    if [ "${NO_COLOR:-}" = "1" ]; then
+        echo "✓ $1"
+    else
+        echo -e "${GREEN}✓${NC} $1"
+    fi
 }
 
 print_warning() {
-    echo -e "${YELLOW}⚠${NC} $1"
+    if [ "${NO_COLOR:-}" = "1" ]; then
+        echo "⚠ $1"
+    else
+        echo -e "${YELLOW}⚠${NC} $1"
+    fi
 }
 
 print_error() {
-    echo -e "${RED}✗${NC} $1"
+    if [ "${NO_COLOR:-}" = "1" ]; then
+        echo "✗ $1"
+    else
+        echo -e "${RED}✗${NC} $1"
+    fi
 }
 
 # Helper function to check for errors in API response
