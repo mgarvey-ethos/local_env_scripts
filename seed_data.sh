@@ -63,6 +63,11 @@ LAST_NAMES=(
     "Ryan" "Gardner" "Payne" "Grant" "Dunn" "Kelley" "Spencer" "Hawkins" "Arnold" "Pierce"
 )
 
+# Global arrays for batch organization creation
+# These are populated by create_organizations_batch() and used by create_admins_batch() and create_learners_batch()
+ORG_IDS=()
+ORG_SLUGS=()
+
 # Generate a random number between min and max (inclusive)
 # Uses /dev/urandom for better randomness
 random_number() {
@@ -111,7 +116,7 @@ random_4digit() {
 }
 
 # Generate organization slug (adjective + 4-digit number)
-# Uses timestamp to ensure uniqueness
+# Uses timestamp + process ID + random to ensure uniqueness
 # If DETERMINISTIC_NAMING is set, uses sequential naming: org1, org2, etc.
 generate_org_slug() {
     local org_num=${1:-}
@@ -119,10 +124,12 @@ generate_org_slug() {
         echo "org${org_num}"
     else
         local adj=$(random_adjective)
-        # Use microseconds from timestamp + random for uniqueness
+        # Use microseconds from timestamp + process ID + random for better uniqueness
         local timestamp_part=$(date +%s%N 2>/dev/null | cut -b14-17 || echo "0000")
+        local pid_part=$(($$ % 1000))  # Use process ID for uniqueness
         local random_part=$(random_number 0 9999)
-        local num=$((timestamp_part + random_part))
+        # Combine all parts and ensure we get a 4-digit number
+        local num=$((timestamp_part + pid_part + random_part))
         num=$(printf "%04d" $((num % 10000)))
         echo "${adj}${num}"
     fi
@@ -150,6 +157,7 @@ generate_org_name_from_slug() {
 
 # Generate user email (FirstnameLastname@organization_slug.com)
 # If DETERMINISTIC_NAMING is set, uses: org1_admin1@org1.com, org1_learner1@org1.com, etc.
+# If not using deterministic naming, includes user_num to ensure uniqueness
 generate_user_email() {
     local first_name=$1
     local last_name=$2
@@ -161,8 +169,13 @@ generate_user_email() {
         # Extract role type (ROLE_ADMIN -> admin, ROLE_LEARNER -> learner)
         local role_type=$(echo "$role" | tr '[:upper:]' '[:lower:]' | sed 's/role_//')
         echo "${org_slug}_${role_type}${user_num}@${org_slug}.com"
+    elif [ -n "$user_num" ]; then
+        # Include user number to ensure uniqueness when using random names
+        echo "${first_name}${last_name}${user_num}@${org_slug}.com"
     else
-        echo "${first_name}${last_name}@${org_slug}.com"
+        # Fallback: use timestamp-based uniqueness if user_num not provided
+        local timestamp_part=$(date +%s%N 2>/dev/null | cut -b14-17 || echo "0000")
+        echo "${first_name}${last_name}${timestamp_part}@${org_slug}.com"
     fi
 }
 
@@ -223,7 +236,7 @@ create_organization_with_users() {
         else
             local first_name=$(random_first_name)
             local last_name=$(random_last_name)
-            local email=$(generate_user_email "$first_name" "$last_name" "$org_slug")
+            local email=$(generate_user_email "$first_name" "$last_name" "$org_slug" "" "$i")
         fi
         
         export FIRST_NAME="$first_name"
@@ -270,7 +283,7 @@ create_organization_with_users() {
         else
             local first_name=$(random_first_name)
             local last_name=$(random_last_name)
-            local email=$(generate_user_email "$first_name" "$last_name" "$org_slug")
+            local email=$(generate_user_email "$first_name" "$last_name" "$org_slug" "" "$i")
         fi
         
         export FIRST_NAME="$first_name"
@@ -320,6 +333,12 @@ create_organizations_batch() {
     local admin_count=$2
     local learner_count=$3
     
+    # Enable KSH_ARRAYS in zsh to make arrays 0-indexed like bash
+    # This ensures consistent behavior across shells
+    if [ -n "${ZSH_VERSION:-}" ]; then
+        setopt KSH_ARRAYS 2>/dev/null || true
+    fi
+    
     print_info "Creating ${org_count} organizations..."
     
     # Check for required tokens
@@ -331,7 +350,15 @@ create_organizations_batch() {
     # Store original ORGANIZATION_ID if set
     local original_org_id="${ORGANIZATION_ID:-}"
     
-    # Array to store organization IDs
+    # Clear arrays (they're declared globally at the top of the script)
+    if [ ${#ORG_IDS[@]} -gt 0 ] || [ ${#ORG_SLUGS[@]} -gt 0 ]; then
+        print_warning "WARNING: ORG_IDS or ORG_SLUGS arrays were not empty at start! Clearing them." >&2
+        if [ "${DEBUG:-}" = "1" ]; then
+            print_info "DEBUG: ORG_IDS had ${#ORG_IDS[@]} entries, ORG_SLUGS had ${#ORG_SLUGS[@]} entries" >&2
+        fi
+    fi
+    # Explicitly clear arrays - use unset then redeclare to ensure clean state
+    unset ORG_IDS ORG_SLUGS 2>/dev/null || true
     ORG_IDS=()
     ORG_SLUGS=()
     local org_success=0
@@ -346,26 +373,247 @@ create_organizations_batch() {
         export SKIP_PROMPTS="1"
         export NO_COLOR="1"
         
-        if create_organization > /dev/null 2>&1; then
-            ORG_IDS+=("$ORGANIZATION_ID")
-            ORG_SLUGS+=("$org_slug")
-            ((org_success++))
+        # Clear ORGANIZATION_ID before creating to avoid stale values
+        unset ORGANIZATION_ID
+
+        # Create organization and capture output to temp file (to avoid subshell issues)
+        local temp_output=$(mktemp)
+        local org_id_to_add=""
+        local create_output=""
+        
+        # Run create_organization and capture both return code and output
+        # Note: We redirect output but the function should still export ORGANIZATION_ID
+        # Save current ORGANIZATION_ID before the call to detect if it changes
+        local org_id_before="${ORGANIZATION_ID:-}"
+        
+        if create_organization > "$temp_output" 2>&1; then
+            create_output=$(cat "$temp_output" 2>/dev/null || echo "")
+            
+            # First try to use ORGANIZATION_ID if it was set by the function
+            # Check immediately after the function call to ensure we capture it
+            if [ -n "${ORGANIZATION_ID:-}" ] && [ "$ORGANIZATION_ID" != "null" ] && [ "$ORGANIZATION_ID" != "" ] && [ "$ORGANIZATION_ID" != "$org_id_before" ]; then
+                org_id_to_add="$ORGANIZATION_ID"
+                if [ "${DEBUG:-}" = "1" ] || [ $org -eq 1 ]; then
+                    print_info "DEBUG org #$org: Got ID from ORGANIZATION_ID env var: '$org_id_to_add'" >&2
+                fi
+            fi
+            
+            rm -f "$temp_output"
+            
+            # If ORGANIZATION_ID wasn't set, try to extract from response JSON
+            # The output may contain print statements and ANSI codes, so we need to extract just the JSON
+            if [ -z "$org_id_to_add" ]; then
+                if [ "${DEBUG:-}" = "1" ] || [ $org -eq 1 ]; then
+                    print_info "DEBUG org #$org: ORGANIZATION_ID not set, extracting from output..." >&2
+                fi
+                # Remove ANSI codes first to avoid parsing issues
+                local clean_output=$(echo "$create_output" | sed 's/\x1b\[[0-9;]*m//g' 2>/dev/null || echo "$create_output")
+                
+                # Strategy 1: Try to find the JSON response by looking for the last JSON object in the output
+                # The create_organization function prints the response with jq, which may be multi-line
+                # Try to extract by finding lines that contain JSON and parsing them
+                # Look for lines containing "organization" and "id" which are likely the JSON response
+                local json_candidate=""
+                while IFS= read -r line; do
+                    # Check if this line looks like it's part of a JSON response
+                    if echo "$line" | grep -qE '(organization|"id")'; then
+                        # Try to extract JSON from this line and surrounding context
+                        # If the line itself is valid JSON, use it; otherwise try to build JSON from multiple lines
+                        local line_json=$(echo "$line" | jq -r '.organization.id // .id // empty' 2>/dev/null)
+                        if [ -n "$line_json" ] && [ "$line_json" != "null" ] && [ "$line_json" != "" ]; then
+                            json_candidate="$line_json"
+                            break
+                        fi
+                    fi
+                done <<< "$clean_output"
+                
+                if [ -n "$json_candidate" ]; then
+                    org_id_to_add="$json_candidate"
+                    if [ "${DEBUG:-}" = "1" ] || [ $org -eq 1 ]; then
+                        print_info "DEBUG org #$org: Strategy 1 succeeded, found ID: '$org_id_to_add'" >&2
+                    fi
+                fi
+                
+                # Strategy 2: Try parsing the entire clean output - jq can extract JSON from mixed content
+                if [ -z "$org_id_to_add" ] || [ "$org_id_to_add" = "null" ] || [ "$org_id_to_add" = "" ]; then
+                    org_id_to_add=$(echo "$clean_output" | jq -r '.organization.id // .id // empty' 2>/dev/null)
+                    if [ -n "$org_id_to_add" ] && [ "$org_id_to_add" != "null" ] && [ "$org_id_to_add" != "" ]; then
+                        if [ "${DEBUG:-}" = "1" ] || [ $org -eq 1 ]; then
+                            print_info "DEBUG org #$org: Strategy 2 succeeded, found ID: '$org_id_to_add'" >&2
+                        fi
+                    fi
+                fi
+                
+                # Strategy 3: Try to extract by looking for the JSON block (lines between { and })
+                # Find the last occurrence of a line starting with { and try to parse from there
+                if [ -z "$org_id_to_add" ] || [ "$org_id_to_add" = "null" ] || [ "$org_id_to_add" = "" ]; then
+                    # Get the line number of the last line starting with {
+                    local last_json_start=$(echo "$clean_output" | grep -n '^\s*{' | tail -n1 | cut -d: -f1)
+                    if [ -n "$last_json_start" ]; then
+                        # Extract from that line to the end and try to parse
+                        local json_tail=$(echo "$clean_output" | sed -n "${last_json_start},\$p")
+                        org_id_to_add=$(echo "$json_tail" | jq -r '.organization.id // empty' 2>/dev/null)
+                        if [ -n "$org_id_to_add" ] && [ "$org_id_to_add" != "null" ] && [ "$org_id_to_add" != "" ]; then
+                            if [ "${DEBUG:-}" = "1" ] || [ $org -eq 1 ]; then
+                                print_info "DEBUG org #$org: Strategy 3 succeeded, found ID: '$org_id_to_add'" >&2
+                            fi
+                        fi
+                    fi
+                fi
+                
+                # Strategy 4: Try parsing the original output as-is (in case ANSI removal broke something)
+                if [ -z "$org_id_to_add" ] || [ "$org_id_to_add" = "null" ] || [ "$org_id_to_add" = "" ]; then
+                    org_id_to_add=$(echo "$create_output" | jq -r '.organization.id // .id // empty' 2>/dev/null)
+                    if [ -n "$org_id_to_add" ] && [ "$org_id_to_add" != "null" ] && [ "$org_id_to_add" != "" ]; then
+                        if [ "${DEBUG:-}" = "1" ] || [ $org -eq 1 ]; then
+                            print_info "DEBUG org #$org: Strategy 4 succeeded, found ID: '$org_id_to_add'" >&2
+                        fi
+                    elif [ "${DEBUG:-}" = "1" ] || [ $org -eq 1 ]; then
+                        print_info "DEBUG org #$org: All extraction strategies failed" >&2
+                    fi
+                fi
+            fi
+            
+            # Only add to arrays if we have a valid org ID
+            # Use a comprehensive check to ensure org_id_to_add is valid
+            local is_valid_id=false
+            
+            # Check if org_id_to_add exists and is not empty/null
+            if [ -n "${org_id_to_add:-}" ] && [ "$org_id_to_add" != "null" ] && [ "$org_id_to_add" != "" ]; then
+                # Trim whitespace and check length
+                local trimmed_id=$(echo "$org_id_to_add" | tr -d '[:space:]')
+                if [ -n "$trimmed_id" ] && [ "$trimmed_id" != "null" ] && [ ${#trimmed_id} -gt 0 ]; then
+                    is_valid_id=true
+                fi
+            fi
+            
+            if [ "$is_valid_id" = true ]; then
+                # Add to arrays - use trimmed_id to ensure no whitespace issues
+                # Calculate final_id - don't use 'local' to avoid scoping issues
+                final_id=$(echo "$org_id_to_add" | tr -d '[:space:]')
+                # Final safety check before adding - verify the value is still valid
+                if [ -z "$final_id" ] || [ "$final_id" = "null" ] || [ ${#final_id} -eq 0 ]; then
+                    print_error "ERROR: Attempted to add invalid ID to arrays! org_id_to_add='$org_id_to_add', final_id='$final_id' for org #$org" >&2
+                    ((org_failed++))
+                else
+                    # Store array length before append for debugging
+                    local array_len_before=${#ORG_IDS[@]}
+                    # Use += which works correctly in both bash and zsh
+                    # Append directly without intermediate local variables to avoid scoping issues
+                    ORG_IDS+=("$final_id")
+                    ORG_SLUGS+=("$org_slug")
+                    local array_len_after=${#ORG_IDS[@]}
+                    ((org_success++))
+                    # Debug output - always show for first few orgs to catch issues
+                    if [ "${DEBUG:-}" = "1" ] || [ $org -le 2 ]; then
+                        print_info "DEBUG: Added org #$org to arrays - before: $array_len_before, after: $array_len_after, id='$final_id', slug='$org_slug'" >&2
+                        # Verify by checking the last element (with KSH_ARRAYS set, arrays are 0-indexed)
+                        if [ $array_len_after -gt $array_len_before ]; then
+                            local last_idx=$((array_len_after - 1))
+                            local verify_id="${ORG_IDS[$last_idx]}"
+                            if [ "$verify_id" != "$final_id" ]; then
+                                print_error "ERROR: Array append verification failed! Expected '$final_id' at index $last_idx, got '$verify_id'" >&2
+                            fi
+                        fi
+                    fi
+                fi
+            else
+                # Failed to extract valid ID
+                print_error "Organization created but ORGANIZATION_ID not set for: $org_name (org #$org)" >&2
+                print_error "ORGANIZATION_ID env var: ${ORGANIZATION_ID:-<not set>}" >&2
+                print_error "org_id_to_add value: '${org_id_to_add:-<empty>}'" >&2
+                print_error "Response preview: $(echo "$create_output" | head -c 500)" >&2
+                # Show full output for debugging (always for org #1, or if DEBUG is enabled)
+                if [ $org -eq 1 ] || [ "${DEBUG:-}" = "1" ]; then
+                    print_error "Full output for org #$org:" >&2
+                    echo "$create_output" >&2
+                fi
+                ((org_failed++))
+            fi
         else
+            create_output=$(cat "$temp_output" 2>/dev/null || echo "")
+            rm -f "$temp_output"
+            print_error "Failed to create organization: $org_name (org #$org)" >&2
+            print_error "Error: $(echo "$create_output" | head -c 500)" >&2
             ((org_failed++))
+            # Explicitly ensure we don't add anything to arrays when creation fails
+            org_id_to_add=""
+            unset ORGANIZATION_ID
         fi
+        
+        # Clear ORGANIZATION_ID for next iteration to avoid stale values  
+        unset ORGANIZATION_ID
         unset SKIP_PROMPTS
         unset NO_COLOR
         
         printf "\r  Organizations Created: %d/%d" "$org_success" "$org_count" >&2
-        sleep 0.01
+        # Small delay to avoid rate limiting and allow org to be fully available
+        sleep 0.1
     done
     echo "" >&2
     
-    if [ $org_failed -eq 0 ]; then
+    # Clean up arrays: remove any invalid entries (empty, null, or whitespace-only IDs)
+    # This ensures we don't have any invalid entries that could cause issues later
+    if [ "${DEBUG:-}" = "1" ]; then
+        print_info "DEBUG: Before cleanup - ORG_IDS array length: ${#ORG_IDS[@]}" >&2
+        local debug_idx=0
+        while [ $debug_idx -lt ${#ORG_IDS[@]} ]; do
+            print_info "DEBUG:   Index $debug_idx: id='${ORG_IDS[$debug_idx]}', slug='${ORG_SLUGS[$debug_idx]}'" >&2
+            ((debug_idx++))
+        done
+    fi
+    local cleaned_org_ids=()
+    local cleaned_org_slugs=()
+    local valid_count=0
+    # Use a counter loop that works in both bash and zsh
+    local idx=0
+    while [ $idx -lt ${#ORG_IDS[@]} ]; do
+        local org_id="${ORG_IDS[$idx]}"
+        local org_slug="${ORG_SLUGS[$idx]}"
+        # Trim whitespace and check if valid
+        local trimmed_id=$(echo "$org_id" | tr -d '[:space:]')
+        if [ -n "$trimmed_id" ] && [ "$trimmed_id" != "null" ] && [ "$trimmed_id" != "" ]; then
+            cleaned_org_ids+=("$trimmed_id")
+            cleaned_org_slugs+=("$org_slug")
+            ((valid_count++))
+        else
+            print_warning "Removing invalid organization entry at index $idx (id: '${org_id}', slug: '${org_slug}')" >&2
+            if [ "${DEBUG:-}" = "1" ]; then
+                print_info "DEBUG:   Invalid entry details - org_id length: ${#org_id}, trimmed_id length: ${#trimmed_id}" >&2
+            fi
+        fi
+        ((idx++))
+    done
+    # Replace arrays with cleaned versions
+    ORG_IDS=("${cleaned_org_ids[@]}")
+    ORG_SLUGS=("${cleaned_org_slugs[@]}")
+    
+    if [ $org_failed -eq 0 ] && [ ${#ORG_IDS[@]} -eq $org_success ]; then
         print_success "Created ${org_success} organization(s)"
     else
-        print_warning "Created ${org_success} organization(s), ${org_failed} failed"
+        local actual_valid=${#ORG_IDS[@]}
+        if [ $actual_valid -ne $org_success ]; then
+            print_warning "Created ${org_success} organization(s) but ${actual_valid} have valid IDs (${org_failed} failed, $((org_success - actual_valid)) invalid entries removed)"
+        else
+            print_warning "Created ${org_success} organization(s), ${org_failed} failed"
+        fi
     fi
+    
+    # Validate that we have organizations before proceeding
+    if [ ${#ORG_IDS[@]} -eq 0 ]; then
+        print_error "No organizations were successfully created. Cannot proceed with user creation." >&2
+        # Restore original ORGANIZATION_ID if it was set
+        if [ -n "$original_org_id" ]; then
+            export ORGANIZATION_ID="$original_org_id"
+        else
+            unset ORGANIZATION_ID
+        fi
+        return 1
+    fi
+    
+    # Wait a moment for organizations to be fully available in the system
+    print_info "Waiting for organizations to be fully available..."
+    sleep 1
     
     # Restore original ORGANIZATION_ID if it was set
     if [ -n "$original_org_id" ]; then
@@ -378,6 +626,14 @@ create_organizations_batch() {
 # Create admins across all organizations
 create_admins_batch() {
     local admin_count_per_org=$1
+    
+    # Ensure ORG_IDS is initialized (it should be set by create_organizations_batch)
+    # Check array length directly (compatible with both bash and zsh)
+    if [ ${#ORG_IDS[@]} -eq 0 ]; then
+        print_error "ORG_IDS array is empty. Please run create_organizations_batch() first."
+        return 1
+    fi
+    
     local total_orgs=${#ORG_IDS[@]}
     local total_admins=$((total_orgs * admin_count_per_org))
     
@@ -387,9 +643,22 @@ create_admins_batch() {
     local admin_failed=0
     local current_admin=0
     
-    for org_idx in "${!ORG_IDS[@]}"; do
+    # Iterate over array indices (works in both bash and zsh)
+    local org_idx=0
+    while [ $org_idx -lt ${#ORG_IDS[@]} ]; do
         local org_id="${ORG_IDS[$org_idx]}"
         local org_slug="${ORG_SLUGS[$org_idx]}"
+        
+        # Validate org_id before processing this organization
+        if [ -z "$org_id" ] || [ "$org_id" = "null" ]; then
+            print_warning "Skipping invalid organization at index $org_idx (slug: ${org_slug:-unknown})" >&2
+            # Skip all users for this org
+            for ((i=1; i<=admin_count_per_org; i++)); do
+                ((admin_failed++))
+            done
+            ((org_idx++))
+            continue
+        fi
         
         for ((i=1; i<=admin_count_per_org; i++)); do
             ((current_admin++))
@@ -401,7 +670,9 @@ create_admins_batch() {
             else
                 local first_name=$(random_first_name)
                 local last_name=$(random_last_name)
-                local email=$(generate_user_email "$first_name" "$last_name" "$org_slug")
+                # Use org_idx and user number to ensure uniqueness across all orgs
+                local unique_id=$((org_idx * 10000 + i))
+                local email=$(generate_user_email "$first_name" "$last_name" "$org_slug" "" "$unique_id")
             fi
             
             export FIRST_NAME="$first_name"
@@ -412,17 +683,31 @@ create_admins_batch() {
             export SKIP_PROMPTS="1"
             export NO_COLOR="1"
             
-            if create_user > /dev/null 2>&1; then
-                ((admin_success++))
-            else
+            # Validate org_id is not empty before attempting to create user
+            if [ -z "$org_id" ] || [ "$org_id" = "null" ]; then
+                print_error "Failed to create admin: Invalid org_id='$org_id' for org_slug='$org_slug' at index $org_idx" >&2
                 ((admin_failed++))
+            else
+                # Capture output to show errors
+                local user_output=$(mktemp)
+                if create_user > "$user_output" 2>&1; then
+                    ((admin_success++))
+                else
+                    ((admin_failed++))
+                    print_error "Failed to create admin #$i for org #$org_idx (slug: $org_slug, id: $org_id)" >&2
+                    print_error "  Email: $email, Name: $first_name $last_name" >&2
+                    print_error "  Error output: $(cat "$user_output" | head -c 500)" >&2
+                fi
+                rm -f "$user_output"
             fi
             unset SKIP_PROMPTS
             unset NO_COLOR
             
             printf "\r  Admins Created: %d/%d" "$admin_success" "$total_admins" >&2
-            sleep 0.02
+            # Small delay to avoid rate limiting
+            sleep 0.05
         done
+        ((org_idx++))
     done
     echo "" >&2
     
@@ -436,6 +721,14 @@ create_admins_batch() {
 # Create learners across all organizations
 create_learners_batch() {
     local learner_count_per_org=$1
+    
+    # Ensure ORG_IDS is initialized (it should be set by create_organizations_batch)
+    # Check array length directly (compatible with both bash and zsh)
+    if [ ${#ORG_IDS[@]} -eq 0 ]; then
+        print_error "ORG_IDS array is empty. Please run create_organizations_batch() first."
+        return 1
+    fi
+    
     local total_orgs=${#ORG_IDS[@]}
     local total_learners=$((total_orgs * learner_count_per_org))
     
@@ -445,9 +738,22 @@ create_learners_batch() {
     local learner_failed=0
     local current_learner=0
     
-    for org_idx in "${!ORG_IDS[@]}"; do
+    # Iterate over array indices (works in both bash and zsh)
+    local org_idx=0
+    while [ $org_idx -lt ${#ORG_IDS[@]} ]; do
         local org_id="${ORG_IDS[$org_idx]}"
         local org_slug="${ORG_SLUGS[$org_idx]}"
+        
+        # Validate org_id before processing this organization
+        if [ -z "$org_id" ] || [ "$org_id" = "null" ]; then
+            print_warning "Skipping invalid organization at index $org_idx (slug: ${org_slug:-unknown})" >&2
+            # Skip all users for this org
+            for ((i=1; i<=learner_count_per_org; i++)); do
+                ((learner_failed++))
+            done
+            ((org_idx++))
+            continue
+        fi
         
         for ((i=1; i<=learner_count_per_org; i++)); do
             ((current_learner++))
@@ -459,7 +765,9 @@ create_learners_batch() {
             else
                 local first_name=$(random_first_name)
                 local last_name=$(random_last_name)
-                local email=$(generate_user_email "$first_name" "$last_name" "$org_slug")
+                # Use org_idx and user number to ensure uniqueness across all orgs
+                local unique_id=$((org_idx * 10000 + i))
+                local email=$(generate_user_email "$first_name" "$last_name" "$org_slug" "" "$unique_id")
             fi
             
             export FIRST_NAME="$first_name"
@@ -470,17 +778,31 @@ create_learners_batch() {
             export SKIP_PROMPTS="1"
             export NO_COLOR="1"
             
-            if create_user > /dev/null 2>&1; then
-                ((learner_success++))
-            else
+            # Validate org_id is not empty before attempting to create user
+            if [ -z "$org_id" ] || [ "$org_id" = "null" ]; then
+                print_error "Failed to create learner: Invalid org_id='$org_id' for org_slug='$org_slug' at index $org_idx" >&2
                 ((learner_failed++))
+            else
+                # Capture output to show errors
+                local user_output=$(mktemp)
+                if create_user > "$user_output" 2>&1; then
+                    ((learner_success++))
+                else
+                    ((learner_failed++))
+                    print_error "Failed to create learner #$i for org #$org_idx (slug: $org_slug, id: $org_id)" >&2
+                    print_error "  Email: $email, Name: $first_name $last_name" >&2
+                    print_error "  Error output: $(cat "$user_output" | head -c 500)" >&2
+                fi
+                rm -f "$user_output"
             fi
             unset SKIP_PROMPTS
             unset NO_COLOR
             
             printf "\r  Learners Created: %d/%d" "$learner_success" "$total_learners" >&2
-            sleep 0.01
+            # Small delay to avoid rate limiting
+            sleep 0.02
         done
+        ((org_idx++))
     done
     echo "" >&2
     
@@ -493,20 +815,20 @@ create_learners_batch() {
 
 # Scenario 1: 10 organizations, each with 5 admins, and 200 learners
 seed_scenario_1() {
-    print_info "=== Scenario 1: 10 organizations ==="
-    print_info "Each org: 5 admins, 200 learners"
+    print_info "=== Scenario 1: 5 organizations ==="
+    print_info "Each org: 2 admins, 10 learners (10 total admins, 50 total learners)"
     if [ "${DETERMINISTIC_NAMING:-}" = "1" ]; then
         print_info "Using deterministic naming"
     fi
     
     # Create all organizations first
-    create_organizations_batch 10 5 200
+    create_organizations_batch 5 2 10
     
     # Then create all admins
-    create_admins_batch 5
+    create_admins_batch 2
     
     # Then create all learners
-    create_learners_batch 200
+    create_learners_batch 10
     
     print_success "Scenario 1 complete!"
 }
